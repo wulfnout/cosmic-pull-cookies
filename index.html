@@ -412,7 +412,8 @@ footer{padding-block:3rem;border-top:1px solid var(--dust)}
           </div>
           <p class="note" id="tWhen"></p>
           <p class="err" id="err" hidden></p>
-          <button type="button" class="btn btn-gold" id="placeBtn">Place order</button>
+          <button type="button" class="btn btn-gold" id="placeBtn">Pay with card</button>
+          <p class="note" id="payNote">You'll pay securely on Stripe's checkout page.</p>
           <a class="btn btn-dd" id="ddBtn" href="https://www.doordash.com/" target="_blank" rel="noopener" hidden>Order on DoorDash</a>
           <div class="confirm" id="confirm" hidden></div>
         </aside>
@@ -636,6 +637,7 @@ footer{padding-block:3rem;border-top:1px solid var(--dust)}
     $('contactRow').hidden = !!m.external;
     $('emailField').hidden = !!m.external;
     $('placeBtn').hidden = !!m.external;
+    $('payNote').hidden = !!m.external;
     $('ddBtn').hidden = !m.external;
     $('err').hidden = true;
     $('dateLabel').textContent = m.dateLabel;
@@ -659,17 +661,24 @@ footer{padding-block:3rem;border-top:1px solid var(--dust)}
   }
   date.addEventListener('change', renderWhen); $('time').addEventListener('change', renderWhen);
 
-  // Orders are saved to Supabase. Paste your project URL and publishable key here.
+  // Payments run through a Supabase Edge Function that opens Stripe Checkout.
   const SUPABASE_URL = 'https://rmbfntkwtlusunjccpnv.supabase.co';
   const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJtYmZudGt3dGx1c3VuamNjcG52Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTIwNDAwMTgsImV4cCI6MjEwNzYxNjAxOH0.tjg52qqNRAU44UpyWZ8qImvH1oFleFm2BaxPNOzqb_4';
   const supabaseReady = SUPABASE_URL.startsWith('https://') && !SUPABASE_KEY.startsWith('PASTE');
 
-  async function saveOrder(row) {
-    const headers = { 'Content-Type': 'application/json', apikey: SUPABASE_KEY, Prefer: 'return=minimal' };
-    if (SUPABASE_KEY.startsWith('eyJ')) headers.Authorization = 'Bearer ' + SUPABASE_KEY;
-    const res = await fetch(SUPABASE_URL.replace(/\/$/, '') + '/rest/v1/orders', { method: 'POST', headers, body: JSON.stringify(row) });
-    if (!res.ok) throw new Error(await res.text());
-  }
+  // Coming back from Stripe
+  const showReturn = () => {
+    let q; try { q = new URLSearchParams(location.search); } catch (e) { return; }
+    const c = $('confirm'), err = $('err');
+    if (q.get('paid')) {
+      c.textContent = `Payment received, thank you! Your order number is #${q.get('paid').replace(/\D/g, '')}. We'll text you to confirm the details.`;
+      c.hidden = false;
+    } else if (q.get('canceled')) {
+      err.textContent = "Checkout was cancelled, so you weren't charged. Add your cookies again whenever you're ready.";
+      err.hidden = false;
+    }
+    if (q.get('paid') || q.get('canceled')) { try { history.replaceState(null, '', location.pathname + '#order'); } catch (e) {} }
+  };
 
   $('placeBtn').addEventListener('click', async () => {
     const err = $('err'), m = method(); let msg = '';
@@ -688,32 +697,34 @@ footer{padding-block:3rem;border-top:1px solid var(--dust)}
     err.hidden = !msg; err.textContent = msg;
     if (msg) return;
 
-    const sub = cart.reduce((a, l) => a + lineTotal(l), 0);
-    const items = cart.map(l => l.type === 'single'
-      ? { type: 'single', cookie: byId[l.id].name, qty: l.qty, price: byId[l.id].price, line_total: lineTotal(l) }
-      : { type: 'box', size: l.size, contents: Object.fromEntries(Object.entries(l.contents).filter(([, n]) => n).map(([id, n]) => [byId[id].name, n])), line_total: Math.round(l.price * 100) / 100 });
-    const row = {
-      method: key, customer_name: name, phone, email: email || null,
-      address: $('address').value.trim(), deliver_on: date.value, deliver_at: m.timed ? tm : null,
-      items, subtotal: Math.round(sub * 100) / 100, fee: fee(), total: Math.round((sub + fee()) * 100) / 100
+    const order = {
+      method: key, name, phone, email, address: $('address').value.trim(),
+      date: date.value, time: m.timed ? tm : null,
+      cart: cart.map(l => l.type === 'single' ? { type: 'single', id: l.id, qty: l.qty } : { type: 'box', size: l.size, contents: l.contents })
     };
-
-    const btn = $('placeBtn'), c = $('confirm');
-    btn.disabled = true; btn.textContent = 'Sending your order…';
-    try {
-      if (supabaseReady) await saveOrder(row);
-      c.textContent = `Order received, ${name}! ${cart.length} item${cart.length > 1 ? 's' : ''}, ${money(row.total)} total. ${$('tWhen').textContent} to ${row.address}. We'll text ${phone} to confirm your order and payment.`;
+    const c = $('confirm');
+    if (!supabaseReady) {
+      c.textContent = 'Preview only: on the live site this button opens Stripe checkout to pay.';
       c.hidden = false;
-      cart = []; renderCart(); c.hidden = false;
+      return;
+    }
+    const btn = $('placeBtn');
+    btn.disabled = true; btn.textContent = 'Opening secure checkout…';
+    try {
+      const headers = { 'Content-Type': 'application/json', apikey: SUPABASE_KEY };
+      if (SUPABASE_KEY.startsWith('eyJ')) headers.Authorization = 'Bearer ' + SUPABASE_KEY;
+      const res = await fetch(SUPABASE_URL.replace(/\/$/, '') + '/functions/v1/create-checkout', { method: 'POST', headers, body: JSON.stringify(order) });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.url) throw new Error(data.error || "Checkout couldn't be opened. Please try again.");
+      location.href = data.url;
     } catch (e) {
-      err.textContent = "Your order didn't go through. Check your connection and try again.";
+      err.textContent = e.message && !/fetch|network/i.test(e.message) ? e.message : "We couldn't reach checkout. Check your connection and try again.";
       err.hidden = false;
-    } finally {
-      btn.disabled = false; btn.textContent = 'Place order';
+      btn.disabled = false; btn.textContent = 'Pay with card';
     }
   });
 
-  renderPicker(); renderCart(); renderMethod();
+  renderPicker(); renderCart(); renderMethod(); showReturn();
 
   // Star field: dust spiralling into the center cookie
   const cv = document.getElementById('field'), cx = cv.getContext('2d');
